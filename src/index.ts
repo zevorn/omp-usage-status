@@ -126,6 +126,18 @@ interface SplitStatusLineContent {
 	suffixWidth: number;
 }
 
+interface SeparatorInsertion {
+	text: string;
+	width: number;
+}
+
+interface ShrinkableGap {
+	start: number;
+	width: number;
+}
+
+const HORIZONTAL_FILL_CHARS = "─━═╌╍┄┅┈┉";
+
 function trimLeadingMarkerGap(suffix: string): string {
 	const markerIndex = suffix.indexOf(PLAY_STATUS_MARKER);
 	if (markerIndex <= 0) return suffix;
@@ -165,17 +177,115 @@ function splitTrailingPlayStatusMarker(content: string, width: number): SplitSta
 	};
 }
 
+function removeLeadingVisibleWhitespace(text: string): string {
+	let index = 0;
+	while (index < text.length) {
+		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
+		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(text);
+		if (match) {
+			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
+			continue;
+		}
+		const code = text.charCodeAt(index);
+		if (code === 9 || code === 32) return `${text.slice(0, index)}${text.slice(index + 1)}`;
+		return text;
+	}
+	return text;
+}
+
+function separatorAfter(content: string, segment: StatusLinePatchSegment): SeparatorInsertion {
+	if (!content) return { text: "", width: 0 };
+	const plain = stripAnsi(content);
+	if (!plain) return { text: "", width: 0 };
+	const separator = plain.endsWith(" ") || plain.endsWith("\t") ? removeLeadingVisibleWhitespace(segment.separator) : segment.separator;
+	return { text: separator, width: visibleWidth(separator) };
+}
+
+function findShrinkableGap(content: string, requiredWidth: number): ShrinkableGap | undefined {
+	if (requiredWidth <= 0) return undefined;
+	let best: ShrinkableGap | undefined;
+	let runStart = -1;
+	let runWidth = 0;
+	let runChar = "";
+
+	const finishRun = () => {
+		if (runWidth >= requiredWidth && (!best || runWidth > best.width)) {
+			best = { start: runStart, width: runWidth };
+		}
+		runStart = -1;
+		runWidth = 0;
+		runChar = "";
+	};
+
+	for (let index = 0; index < content.length;) {
+		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
+		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(content);
+		if (match) {
+			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
+			continue;
+		}
+
+		const char = content[index];
+		if (char && HORIZONTAL_FILL_CHARS.includes(char)) {
+			if (runStart >= 0 && char === runChar) {
+				runWidth += 1;
+			} else {
+				finishRun();
+				runStart = index;
+				runWidth = 1;
+				runChar = char;
+			}
+		} else {
+			finishRun();
+		}
+		index += 1;
+	}
+	finishRun();
+	return best;
+}
+
+function insertUsageIntoShrinkableGap(content: string, baseWidth: number, targetWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
+	const gapProbe = findShrinkableGap(content, 1);
+	if (!gapProbe) return undefined;
+	const prefix = content.slice(0, gapProbe.start);
+	const separator = separatorAfter(prefix, segment);
+	const insertWidth = separator.width + segment.width;
+	const slack = Math.max(0, targetWidth - baseWidth);
+	const requiredRemoval = insertWidth - slack;
+	if (requiredRemoval <= 0) {
+		return {
+			content: `${content.slice(0, gapProbe.start)}${separator.text}${segment.text}${content.slice(gapProbe.start)}`,
+			width: baseWidth + insertWidth,
+		};
+	}
+	const gap = gapProbe.width >= requiredRemoval ? gapProbe : findShrinkableGap(content, requiredRemoval);
+	if (!gap || gap.width < requiredRemoval) return undefined;
+	return {
+		content: `${content.slice(0, gap.start)}${separator.text}${segment.text}${content.slice(gap.start + requiredRemoval)}`,
+		width: baseWidth + insertWidth - requiredRemoval,
+	};
+}
+
 function appendUsageToTopBorder(border: StatusLineBorderLike, maxWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike {
 	const content = typeof border.content === "string" ? border.content : "";
 	if (content.includes(segment.text) || (segment.plainText.length > 0 && stripAnsi(content).includes(segment.plainText))) return border;
 	const rawBaseWidth = typeof border.width === "number" && Number.isFinite(border.width) ? border.width : visibleWidth(content);
+	const targetWidth = maxWidth > 0 ? maxWidth : rawBaseWidth;
 	const base = splitTrailingPlayStatusMarker(content, rawBaseWidth);
-	const separator = base.content ? segment.separator : "";
-	const extraWidth = (base.content ? segment.separatorWidth : 0) + segment.width + base.suffixWidth;
-	if (maxWidth > 0 && base.width + extraWidth > maxWidth) return border;
+	const separator = separatorAfter(base.content, segment);
+	const appendedWidth = base.width + separator.width + segment.width + base.suffixWidth;
+	if (appendedWidth <= targetWidth) {
+		return {
+			content: `${base.content}${separator.text}${segment.text}${base.suffix}`,
+			width: appendedWidth,
+		};
+	}
+	const inserted = insertUsageIntoShrinkableGap(content, rawBaseWidth, targetWidth, segment);
+	if (inserted) return inserted;
+	if (maxWidth > 0) return border;
 	return {
-		content: `${base.content}${separator}${segment.text}${base.suffix}`,
-		width: base.width + extraWidth,
+		content: `${base.content}${separator.text}${segment.text}${base.suffix}`,
+		width: appendedWidth,
 	};
 }
 function plainStatusLineSegment(text: string): StatusLinePatchSegment {

@@ -379,6 +379,44 @@ describe("extension refresh controller", () => {
 		resetPiStatusLinePatchForTest();
 	});
 
+	test("shrinks status-line filler instead of dropping usage on full-width refresh", async () => {
+		const baseContent = `π > model ${"─".repeat(20)} ctx`;
+		class FullStatusLine {
+			getTopBorder(_width: number): { content: string; width: number } {
+				return { content: baseContent, width: baseContent.length };
+			}
+		}
+		resetPiStatusLinePatchForTest();
+		const installed = installPiStatusLinePatch({ pi: { StatusLineComponent: FullStatusLine } } as never);
+		expect(installed).toBe(true);
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus() {},
+				theme: { fg: (_token: string, text: string) => text },
+			},
+		} as never;
+		const controller = new UsageStatusController();
+
+		controller.schedule(ctx, "initial");
+		await controller.flush();
+		const border = new FullStatusLine().getTopBorder(baseContent.length);
+
+		expect(stripAnsi(border.content)).toBe(`π > model > 🪙 5h 42%${"─".repeat(9)} ctx`);
+		expect(border.width).toBe(baseContent.length);
+		controller.dispose(ctx);
+		resetPiStatusLinePatchForTest();
+	});
+
 	test("editor top-border refresh keeps usage segment attached", async () => {
 		const statuses = new Map<string, string | undefined>();
 		const { Editor } = installFakeStatusLineAndEditor();
@@ -406,8 +444,13 @@ describe("extension refresh controller", () => {
 		await controller.flush();
 		const editor = new Editor();
 		editor.setTopBorder({ content: "π > model ▶", width: "π > model ▶".length });
-
 		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe("π > model > 🪙 5h 42%▶");
+
+		const fullContent = `π > model ${"─".repeat(20)} ctx`;
+		editor.setTopBorder({ content: fullContent, width: fullContent.length });
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model > 🪙 5h 42%${"─".repeat(9)} ctx`);
+		expect(editor.topBorder?.width).toBe(fullContent.length);
+
 		expect(statuses.get(STATUS_KEY)).toBeUndefined();
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
