@@ -369,17 +369,71 @@ describe("extension refresh controller", () => {
 		expect(fetchCount).toBe(2);
 		expect(statuses.get(STATUS_KEY)).toBeUndefined();
 		const border = new StatusLine().getTopBorder(80);
-		expect(stripAnsi(border.content)).toBe("π > model > 🪙 5h 42%▶");
-		expect(border.content).toContain(`${bgAnsi}${sepAnsi} > \x1b[0m`);
-		expect(border.content).toContain(`${bgAnsi}${spendAnsi}🪙 5h 42%\x1b[0m`);
-		expect(border.width).toBe("π > model > 🪙 5h 42%▶".length);
+		expect(stripAnsi(border.content)).toBe("π > model ▶ 🪙 5h 42%");
+		expect(border.content).not.toContain(bgAnsi);
+		expect(border.content).toContain(`${sepAnsi} \x1b[0m`);
+		expect(border.content).toContain(`${spendAnsi}🪙 5h 42%\x1b[0m`);
+		expect(border.width).toBe("π > model ▶ 🪙 5h 42%".length);
 		controller.dispose(ctx);
 		expect(statuses.get(STATUS_KEY)).toBeUndefined();
 		expect(new StatusLine().getTopBorder(80).content).not.toContain("42%");
 		resetPiStatusLinePatchForTest();
 	});
 
-	test("shrinks status-line filler and keeps the play marker attached to usage", async () => {
+	test("normalizes stale interactive usage on every refresh without moving the play marker", async () => {
+		let fraction = 0.41;
+		let baseContent = "π > model ▶";
+		class InteractiveStatusLine {
+			getTopBorder(_width: number): { content: string; width: number } {
+				return { content: baseContent, width: baseContent.length };
+			}
+		}
+		resetPiStatusLinePatchForTest();
+		const installed = installPiStatusLinePatch({ pi: { StatusLineComponent: InteractiveStatusLine } } as never);
+		expect(installed).toBe(true);
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus() {},
+				theme: { fg: (_token: string, text: string) => text },
+			},
+		} as never;
+		const controller = new UsageStatusController();
+
+		controller.schedule(ctx, "initial");
+		await controller.flush();
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 41%");
+
+		baseContent = "π > model ▶ > 🪙 5h 41%";
+		fraction = 0.42;
+		controller.schedule(ctx, "refresh");
+		await controller.flush();
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
+
+		baseContent = "π > model ▶ > 🪙 5h 42%";
+		controller.schedule(ctx, "same-render");
+		await controller.flush();
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
+
+		baseContent = `π > model ▶${" ".repeat(20)}`;
+		controller.schedule(ctx, "padded-marker");
+		await controller.flush();
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(20)}`);
+
+		controller.dispose(ctx);
+		resetPiStatusLinePatchForTest();
+	});
+
+	test("shrinks filler so usage follows the play marker when the status line is full", async () => {
 		const baseContent = `π > model ${"─".repeat(20)} ctx ▶`;
 		class FullStatusLine {
 			getTopBorder(_width: number): { content: string; width: number } {
@@ -411,8 +465,45 @@ describe("extension refresh controller", () => {
 		await controller.flush();
 		const border = new FullStatusLine().getTopBorder(baseContent.length);
 
-		expect(stripAnsi(border.content)).toBe(`π > model > 🪙 5h 42%▶${"─".repeat(10)} ctx`);
+		const wideBorder = new FullStatusLine().getTopBorder(80);
+		expect(stripAnsi(wideBorder.content)).toBe(`${baseContent} 🪙 5h 42%`);
+
+		expect(stripAnsi(border.content)).toBe(`π > model ${"─".repeat(10)} ctx ▶ 🪙 5h 42%`);
 		expect(border.width).toBe(baseContent.length);
+
+		const asciiDashContent = `π > model ${"-".repeat(20)} ctx ▶`;
+		class AsciiDashStatusLine {
+			getTopBorder(_width: number): { content: string; width: number } {
+				return { content: asciiDashContent, width: asciiDashContent.length };
+			}
+		}
+		resetPiStatusLinePatchForTest();
+		const asciiDashInstalled = installPiStatusLinePatch({ pi: { StatusLineComponent: AsciiDashStatusLine } } as never);
+		expect(asciiDashInstalled).toBe(true);
+		const asciiDashController = new UsageStatusController();
+		asciiDashController.schedule(ctx, "ascii-dash");
+		await asciiDashController.flush();
+		const asciiDashBorder = new AsciiDashStatusLine().getTopBorder(asciiDashContent.length);
+		expect(stripAnsi(asciiDashBorder.content)).toBe(`π > model ${"-".repeat(10)} ctx ▶ 🪙 5h 42%`);
+		expect(asciiDashBorder.width).toBe(asciiDashContent.length);
+		asciiDashController.dispose(ctx);
+
+		const afterMarkerDashContent = `π > model ▶ ${"─".repeat(20)} ctx`;
+		class AfterMarkerDashStatusLine {
+			getTopBorder(_width: number): { content: string; width: number } {
+				return { content: afterMarkerDashContent, width: afterMarkerDashContent.length };
+			}
+		}
+		resetPiStatusLinePatchForTest();
+		const afterMarkerDashInstalled = installPiStatusLinePatch({ pi: { StatusLineComponent: AfterMarkerDashStatusLine } } as never);
+		expect(afterMarkerDashInstalled).toBe(true);
+		const afterMarkerDashController = new UsageStatusController();
+		afterMarkerDashController.schedule(ctx, "after-marker-dash");
+		await afterMarkerDashController.flush();
+		const afterMarkerDashBorder = new AfterMarkerDashStatusLine().getTopBorder(afterMarkerDashContent.length);
+		expect(stripAnsi(afterMarkerDashBorder.content)).toBe(`π > model ▶ 🪙 5h 42% ${"─".repeat(10)} ctx`);
+		expect(afterMarkerDashBorder.width).toBe(afterMarkerDashContent.length);
+		afterMarkerDashController.dispose(ctx);
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
 	});
@@ -444,10 +535,10 @@ describe("extension refresh controller", () => {
 		await controller.flush();
 		const editor = new Editor();
 		editor.setTopBorder({ content: "π > model ▶", width: "π > model ▶".length });
-		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe("π > model > 🪙 5h 42%▶");
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe("π > model ▶ 🪙 5h 42%");
 		const fullContent = `π > model ${"─".repeat(20)} ctx ▶`;
 		editor.setTopBorder({ content: fullContent, width: fullContent.length });
-		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model > 🪙 5h 42%▶${"─".repeat(10)} ctx`);
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model ${"─".repeat(10)} ctx ▶ 🪙 5h 42%`);
 		expect(editor.topBorder?.width).toBe(fullContent.length);
 
 		expect(statuses.get(STATUS_KEY)).toBeUndefined();
@@ -482,14 +573,14 @@ describe("extension refresh controller", () => {
 
 		controller.schedule(ctx, "initial");
 		await controller.flush();
-		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe("π > model > 🪙 5h 42%▶");
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
 
 		fail = true;
 		controller.schedule(ctx, "failure");
 		await controller.flush();
 
 		expect(statuses.get(STATUS_KEY)).toBeUndefined();
-		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe("π > model > 🪙 5h 42%▶");
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
 	});

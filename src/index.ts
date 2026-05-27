@@ -17,12 +17,14 @@ function getAuthStorage(ctx: ExtensionContext): AuthStorageLike | undefined {
 	return (ctx.modelRegistry as unknown as { authStorage?: AuthStorageLike }).authStorage;
 }
 
-const STATUS_LINE_SEPARATOR = " > ";
+const STATUS_LINE_SEPARATOR = " ";
 const PLAY_STATUS_MARKER = "▶";
+const LEGACY_STATUS_LINE_SEPARATOR = " > ";
+const HORIZONTAL_FILL_CHARS = "─━═╌╍┄┅┈┉-";
 const ANSI_SEQUENCE_SOURCE = "\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\)|[()][A-Za-z0-9]|[=>])";
 const ANSI_SEQUENCE_PATTERN = new RegExp(ANSI_SEQUENCE_SOURCE, "g");
 const ANSI_SEQUENCE_STICKY_PATTERN = new RegExp(ANSI_SEQUENCE_SOURCE, "y");
-const TRAILING_PLAY_STATUS_MARKER_PATTERN = new RegExp(`(?:[\\t ]|${ANSI_SEQUENCE_SOURCE})*${PLAY_STATUS_MARKER}(?:${ANSI_SEQUENCE_SOURCE})*$`);
+const TRAILING_PADDING_PATTERN = new RegExp(`(?:[\\t ]|[${HORIZONTAL_FILL_CHARS}]|${ANSI_SEQUENCE_SOURCE})+$`);
 
 interface StatusLinePatchSegment {
 	text: string;
@@ -52,15 +54,12 @@ function statusLineSegment(ctx: ExtensionContext, severity: UsageSeverity, text:
 	let separator = STATUS_LINE_SEPARATOR;
 
 	try {
-		if (typeof theme.getBgAnsi === "function" && typeof theme.getFgAnsi === "function") {
-			const background = theme.getBgAnsi("statusLineBg");
-			segmentText = `${background}${theme.getFgAnsi(token)}${text}\x1b[0m`;
-			separator = `${background}${theme.getFgAnsi("statusLineSep")}${STATUS_LINE_SEPARATOR}\x1b[0m`;
-		} else if (typeof theme.bg === "function") {
-			segmentText = theme.bg("statusLineBg", foreground(theme, token, text));
-			separator = theme.bg("statusLineBg", foreground(theme, "statusLineSep", STATUS_LINE_SEPARATOR));
+		if (typeof theme.getFgAnsi === "function") {
+			segmentText = `${theme.getFgAnsi(token)}${text}\x1b[0m`;
+			separator = `${theme.getFgAnsi("statusLineSep")}${STATUS_LINE_SEPARATOR}\x1b[0m`;
 		} else {
 			segmentText = foreground(theme, token, text);
+			separator = foreground(theme, "statusLineSep", STATUS_LINE_SEPARATOR);
 		}
 	} catch {
 		segmentText = foreground(theme, token, text);
@@ -83,6 +82,7 @@ type EditorComponentClass = NonNullable<ExtensionAPI["pi"]>["CustomEditor"];
 
 interface StatusLinePatchState {
 	segment: StatusLinePatchSegment | undefined;
+	previousSegment: StatusLinePatchSegment | undefined;
 	text: string | undefined;
 	installed: boolean;
 	editorInstalled: boolean;
@@ -98,6 +98,7 @@ function getStatusLinePatchState(): StatusLinePatchState {
 	const globalState = globalThis as typeof globalThis & { [STATUS_LINE_PATCH_KEY]?: StatusLinePatchState };
 	globalState[STATUS_LINE_PATCH_KEY] ??= {
 		segment: undefined,
+		previousSegment: undefined,
 		text: undefined,
 		installed: false,
 		editorInstalled: false,
@@ -122,8 +123,8 @@ function visibleWidth(text: string): number {
 interface SplitStatusLineContent {
 	content: string;
 	width: number;
-	suffix: string;
-	suffixWidth: number;
+	padding: string;
+	paddingWidth: number;
 }
 
 interface SeparatorInsertion {
@@ -131,49 +132,17 @@ interface SeparatorInsertion {
 	width: number;
 }
 
-interface ShrinkableGap {
-	start: number;
-	width: number;
-}
-
-const HORIZONTAL_FILL_CHARS = "─━═╌╍┄┅┈┉";
-
-function trimLeadingMarkerGap(suffix: string): string {
-	const markerIndex = suffix.indexOf(PLAY_STATUS_MARKER);
-	if (markerIndex <= 0) return suffix;
-
-	let ansiPrefix = "";
-	let index = 0;
-	while (index < markerIndex) {
-		const code = suffix.charCodeAt(index);
-		if (code === 9 || code === 32) {
-			index += 1;
-			continue;
-		}
-		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
-		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(suffix);
-		if (!match || ANSI_SEQUENCE_STICKY_PATTERN.lastIndex > markerIndex) return suffix.slice(markerIndex);
-		ansiPrefix += match[0];
-		index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
-	}
-
-	return `${ansiPrefix}${suffix.slice(markerIndex)}`;
-}
-
-function splitTrailingPlayStatusMarker(content: string, width: number): SplitStatusLineContent {
-	const match = TRAILING_PLAY_STATUS_MARKER_PATTERN.exec(content);
-	if (!match) return { content, width, suffix: "", suffixWidth: 0 };
-	const rawSuffix = match[0];
-	const rawSuffixWidth = visibleWidth(rawSuffix);
-	if (rawSuffixWidth === 0) return { content, width, suffix: "", suffixWidth: 0 };
-	const suffix = trimLeadingMarkerGap(rawSuffix);
-	const suffixWidth = visibleWidth(suffix);
-	if (suffixWidth === 0) return { content, width, suffix: "", suffixWidth: 0 };
+function splitTrailingPadding(content: string, width: number): SplitStatusLineContent {
+	const match = TRAILING_PADDING_PATTERN.exec(content);
+	if (!match) return { content, width, padding: "", paddingWidth: 0 };
+	const padding = match[0];
+	const paddingWidth = visibleWidth(padding);
+	if (paddingWidth === 0) return { content, width, padding: "", paddingWidth: 0 };
 	return {
 		content: content.slice(0, match.index),
-		width: Math.max(0, width - rawSuffixWidth),
-		suffix,
-		suffixWidth,
+		width: Math.max(0, width - paddingWidth),
+		padding,
+		paddingWidth,
 	};
 }
 
@@ -201,16 +170,61 @@ function separatorAfter(content: string, segment: StatusLinePatchSegment): Separ
 	return { text: separator, width: visibleWidth(separator) };
 }
 
-function findShrinkableGap(content: string, requiredWidth: number): ShrinkableGap | undefined {
-	if (requiredWidth <= 0) return undefined;
-	let best: ShrinkableGap | undefined;
+function removeVisiblePrefix(text: string, width: number): string {
+	if (width <= 0) return text;
+	let removed = 0;
+	let index = 0;
+	while (index < text.length && removed < width) {
+		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
+		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(text);
+		if (match) {
+			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
+			continue;
+		}
+		index += 1;
+		removed += 1;
+	}
+	return text.slice(index);
+}
+
+function fitPaddingToTarget(padding: string, paddingWidth: number, usedWidth: number, targetWidth: number): { text: string; width: number } {
+	if (!padding || usedWidth + paddingWidth <= targetWidth) return { text: padding, width: paddingWidth };
+	const fitted = removeVisiblePrefix(padding, usedWidth + paddingWidth - targetWidth);
+	return { text: fitted, width: visibleWidth(fitted) };
+}
+function skipAnsiSequences(text: string, index: number): number {
+	while (index < text.length) {
+		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
+		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(text);
+		if (!match) return index;
+		index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
+	}
+	return index;
+}
+
+function findPlayMarkerInsertion(content: string): number | undefined {
+	const markerIndex = content.lastIndexOf(PLAY_STATUS_MARKER);
+	return markerIndex < 0 ? undefined : skipAnsiSequences(content, markerIndex + PLAY_STATUS_MARKER.length);
+}
+
+interface ShrunkStatusLineContent {
+	content: string;
+	width: number;
+	removedWidth: number;
+}
+
+function shrinkFillerRun(content: string, width: number, requiredWidth: number): ShrunkStatusLineContent | undefined {
+	if (requiredWidth <= 0) return { content, width, removedWidth: 0 };
+	let bestStart = -1;
+	let bestWidth = 0;
 	let runStart = -1;
 	let runWidth = 0;
 	let runChar = "";
 
 	const finishRun = () => {
-		if (runWidth >= requiredWidth && (!best || runWidth > best.width)) {
-			best = { start: runStart, width: runWidth };
+		if (runWidth > bestWidth) {
+			bestStart = runStart;
+			bestWidth = runWidth;
 		}
 		runStart = -1;
 		runWidth = 0;
@@ -235,58 +249,134 @@ function findShrinkableGap(content: string, requiredWidth: number): ShrinkableGa
 				runWidth = 1;
 				runChar = char;
 			}
+
 		} else {
 			finishRun();
 		}
 		index += 1;
 	}
 	finishRun();
-	return best;
-}
 
-function insertUsageIntoShrinkableGap(base: SplitStatusLineContent, targetWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
-	const gapProbe = findShrinkableGap(base.content, 1);
-	if (!gapProbe) return undefined;
-	const prefix = base.content.slice(0, gapProbe.start);
-	const separator = separatorAfter(prefix, segment);
-	const addWidth = separator.width + segment.width;
-	const currentWidth = base.width + base.suffixWidth;
-	const slack = Math.max(0, targetWidth - currentWidth);
-	const requiredRemoval = addWidth - slack;
-	if (requiredRemoval <= 0) {
-		return {
-			content: `${base.content.slice(0, gapProbe.start)}${separator.text}${segment.text}${base.suffix}${base.content.slice(gapProbe.start)}`,
-			width: currentWidth + addWidth,
-		};
-	}
-	const gap = gapProbe.width >= requiredRemoval ? gapProbe : findShrinkableGap(base.content, requiredRemoval);
-	if (!gap || gap.width < requiredRemoval) return undefined;
+	if (bestStart < 0) return undefined;
+	const removedWidth = Math.min(bestWidth, requiredWidth);
 	return {
-		content: `${base.content.slice(0, gap.start)}${separator.text}${segment.text}${base.suffix}${base.content.slice(gap.start + requiredRemoval)}`,
-		width: currentWidth + addWidth - requiredRemoval,
+		content: `${content.slice(0, bestStart)}${content.slice(bestStart + removedWidth)}`,
+		width: Math.max(0, width - removedWidth),
+		removedWidth,
 	};
 }
 
-function appendUsageToTopBorder(border: StatusLineBorderLike, maxWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike {
+function hasHorizontalFiller(content: string): boolean {
+	for (let index = 0; index < content.length;) {
+		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
+		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(content);
+		if (match) {
+			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
+			continue;
+		}
+		const char = content[index];
+		if (char && HORIZONTAL_FILL_CHARS.includes(char)) return true;
+		index += 1;
+	}
+	return false;
+}
+
+
+interface NormalizedStatusLineContent {
+	content: string;
+	width: number;
+}
+
+function removeKnownUsageSegment(content: string, width: number, segment: StatusLinePatchSegment | undefined): NormalizedStatusLineContent {
+	if (!segment) return { content, width };
+	const segmentIndex = content.indexOf(segment.text);
+	if (segmentIndex < 0) return { content, width };
+
+	let start = segmentIndex;
+	let removedWidth = segment.width;
+	const before = content.slice(0, segmentIndex);
+	if (before.endsWith(LEGACY_STATUS_LINE_SEPARATOR)) {
+		start -= LEGACY_STATUS_LINE_SEPARATOR.length;
+		removedWidth += LEGACY_STATUS_LINE_SEPARATOR.length;
+	} else if (segment.separator && before.endsWith(segment.separator)) {
+		start -= segment.separator.length;
+		removedWidth += segment.separatorWidth;
+	}
+
+	return {
+		content: `${content.slice(0, start)}${content.slice(segmentIndex + segment.text.length)}`,
+		width: Math.max(0, width - removedWidth),
+	};
+}
+
+function removeKnownUsageSegments(content: string, width: number, segment: StatusLinePatchSegment, previousSegment: StatusLinePatchSegment | undefined): NormalizedStatusLineContent {
+	let next = removeKnownUsageSegment(content, width, previousSegment);
+	next = removeKnownUsageSegment(next.content, next.width, segment);
+	return next;
+}
+
+function insertUsageAfterPlayMarker(base: SplitStatusLineContent, maxWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
+	const insertion = findPlayMarkerInsertion(base.content);
+	if (insertion === undefined) return undefined;
+	const prefix = base.content.slice(0, insertion);
+	let tail = base.content.slice(insertion);
+	const prefixWidth = visibleWidth(prefix);
+	let tailWidth = visibleWidth(tail);
+	const separator = separatorAfter(prefix, segment);
+	let padding = { text: base.padding, width: base.paddingWidth };
+	let totalWidth = prefixWidth + separator.width + segment.width + tailWidth + padding.width;
+
+	if (maxWidth > 0 && totalWidth > maxWidth && padding.width > 0) {
+		padding = fitPaddingToTarget(padding.text, padding.width, totalWidth - padding.width, maxWidth);
+		totalWidth = prefixWidth + separator.width + segment.width + tailWidth + padding.width;
+	}
+
+	if (maxWidth > 0 && totalWidth > maxWidth) {
+		const shrunk = shrinkFillerRun(tail, tailWidth, totalWidth - maxWidth);
+		if (!shrunk) return undefined;
+		tail = shrunk.content;
+		tailWidth = shrunk.width;
+		totalWidth -= shrunk.removedWidth;
+		if (totalWidth > maxWidth) return undefined;
+	}
+
+	return {
+		content: `${prefix}${separator.text}${segment.text}${tail}${padding.text}`,
+		width: totalWidth,
+	};
+}
+
+function appendUsageToTopBorder(border: StatusLineBorderLike, maxWidth: number, segment: StatusLinePatchSegment, previousSegment?: StatusLinePatchSegment): StatusLineBorderLike {
 	const content = typeof border.content === "string" ? border.content : "";
-	if (content.includes(segment.text) || (segment.plainText.length > 0 && stripAnsi(content).includes(segment.plainText))) return border;
 	const rawBaseWidth = typeof border.width === "number" && Number.isFinite(border.width) ? border.width : visibleWidth(content);
-	const targetWidth = maxWidth > 0 ? maxWidth : rawBaseWidth;
-	const base = splitTrailingPlayStatusMarker(content, rawBaseWidth);
-	const separator = separatorAfter(base.content, segment);
-	const appendedWidth = base.width + separator.width + segment.width + base.suffixWidth;
-	if (appendedWidth <= targetWidth) {
+	const normalized = removeKnownUsageSegments(content, rawBaseWidth, segment, previousSegment);
+	let base = splitTrailingPadding(normalized.content, normalized.width);
+	const markerInserted = insertUsageAfterPlayMarker(base, maxWidth, segment);
+	if (markerInserted) return markerInserted;
+	let separator = separatorAfter(base.content, segment);
+	let usageWidth = base.width + separator.width + segment.width;
+
+	if (maxWidth > 0 && usageWidth > maxWidth) {
+		const shrunk = shrinkFillerRun(base.content, base.width, usageWidth - maxWidth);
+		if (!shrunk) return border;
+		base = { ...base, content: shrunk.content, width: shrunk.width };
+		separator = separatorAfter(base.content, segment);
+		usageWidth = base.width + separator.width + segment.width;
+		if (usageWidth > maxWidth) return border;
+	}
+
+	if (maxWidth > 0) {
+		if (usageWidth > maxWidth) return border;
+		const padding = fitPaddingToTarget(base.padding, base.paddingWidth, usageWidth, maxWidth);
 		return {
-			content: `${base.content}${separator.text}${segment.text}${base.suffix}`,
-			width: appendedWidth,
+			content: `${base.content}${separator.text}${segment.text}${padding.text}`,
+			width: usageWidth + padding.width,
 		};
 	}
-	const inserted = insertUsageIntoShrinkableGap(base, targetWidth, segment);
-	if (inserted) return inserted;
-	if (maxWidth > 0) return border;
+
 	return {
-		content: `${base.content}${separator.text}${segment.text}${base.suffix}`,
-		width: appendedWidth,
+		content: `${base.content}${separator.text}${segment.text}${base.padding}`,
+		width: usageWidth + base.paddingWidth,
 	};
 }
 function plainStatusLineSegment(text: string): StatusLinePatchSegment {
@@ -317,7 +407,7 @@ function installStatusLineComponentPatch(pi: ExtensionAPI): boolean {
 		const border = original.call(this, width);
 		const segment = getCurrentStatusLineSegment(state);
 		if (!border || !segment) return border ?? { content: "", width: 0 };
-		return appendUsageToTopBorder(border, width, segment);
+		return appendUsageToTopBorder(border, width, segment, state.previousSegment);
 	};
 
 	state.component = component;
@@ -339,7 +429,7 @@ function installEditorTopBorderPatch(pi: ExtensionAPI): boolean {
 	const original = current === state.editorPatched && state.editorOriginal ? state.editorOriginal : current;
 	const patched = function patchedSetTopBorder(this: unknown, content: StatusLineBorderLike | undefined): void {
 		const segment = getCurrentStatusLineSegment(state);
-		const next = content && segment ? appendUsageToTopBorder(content, 0, segment) : content;
+		const next = content && segment ? appendUsageToTopBorder(content, hasHorizontalFiller(content.content) ? content.width : 0, segment, state.previousSegment) : content;
 		original.call(this, next);
 	};
 
@@ -359,6 +449,8 @@ export function installPiStatusLinePatch(pi: ExtensionAPI): boolean {
 
 function setPiStatusLineSegment(segment: StatusLinePatchSegment | undefined): boolean {
 	const state = getStatusLinePatchState();
+	if (!segment) state.previousSegment = undefined;
+	if (segment && state.segment && state.segment.text !== segment.text) state.previousSegment = state.segment;
 	state.segment = segment;
 	state.text = segment?.text;
 	return state.installed || state.editorInstalled;
@@ -377,6 +469,7 @@ export function resetPiStatusLinePatchForTest(): void {
 		if (prototype && prototype.setTopBorder === state.editorPatched) prototype.setTopBorder = state.editorOriginal;
 	}
 	state.segment = undefined;
+	state.previousSegment = undefined;
 	state.text = undefined;
 	state.installed = false;
 	state.editorInstalled = false;

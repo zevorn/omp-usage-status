@@ -9,8 +9,7 @@
     "./usage-status": "./src/usage-status.ts"
   },
   "files": [
-    "src",
-    "docs/spark/2026-05-27-omp-usage-status-design.md"
+    "src"
   ],
   "omp": {
     "name": "Usage Status",
