@@ -244,25 +244,26 @@ function findShrinkableGap(content: string, requiredWidth: number): ShrinkableGa
 	return best;
 }
 
-function insertUsageIntoShrinkableGap(content: string, baseWidth: number, targetWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
-	const gapProbe = findShrinkableGap(content, 1);
+function insertUsageIntoShrinkableGap(base: SplitStatusLineContent, targetWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
+	const gapProbe = findShrinkableGap(base.content, 1);
 	if (!gapProbe) return undefined;
-	const prefix = content.slice(0, gapProbe.start);
+	const prefix = base.content.slice(0, gapProbe.start);
 	const separator = separatorAfter(prefix, segment);
-	const insertWidth = separator.width + segment.width;
-	const slack = Math.max(0, targetWidth - baseWidth);
-	const requiredRemoval = insertWidth - slack;
+	const addWidth = separator.width + segment.width;
+	const currentWidth = base.width + base.suffixWidth;
+	const slack = Math.max(0, targetWidth - currentWidth);
+	const requiredRemoval = addWidth - slack;
 	if (requiredRemoval <= 0) {
 		return {
-			content: `${content.slice(0, gapProbe.start)}${separator.text}${segment.text}${content.slice(gapProbe.start)}`,
-			width: baseWidth + insertWidth,
+			content: `${base.content.slice(0, gapProbe.start)}${separator.text}${segment.text}${base.suffix}${base.content.slice(gapProbe.start)}`,
+			width: currentWidth + addWidth,
 		};
 	}
-	const gap = gapProbe.width >= requiredRemoval ? gapProbe : findShrinkableGap(content, requiredRemoval);
+	const gap = gapProbe.width >= requiredRemoval ? gapProbe : findShrinkableGap(base.content, requiredRemoval);
 	if (!gap || gap.width < requiredRemoval) return undefined;
 	return {
-		content: `${content.slice(0, gap.start)}${separator.text}${segment.text}${content.slice(gap.start + requiredRemoval)}`,
-		width: baseWidth + insertWidth - requiredRemoval,
+		content: `${base.content.slice(0, gap.start)}${separator.text}${segment.text}${base.suffix}${base.content.slice(gap.start + requiredRemoval)}`,
+		width: currentWidth + addWidth - requiredRemoval,
 	};
 }
 
@@ -280,7 +281,7 @@ function appendUsageToTopBorder(border: StatusLineBorderLike, maxWidth: number, 
 			width: appendedWidth,
 		};
 	}
-	const inserted = insertUsageIntoShrinkableGap(content, rawBaseWidth, targetWidth, segment);
+	const inserted = insertUsageIntoShrinkableGap(base, targetWidth, segment);
 	if (inserted) return inserted;
 	if (maxWidth > 0) return border;
 	return {

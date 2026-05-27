@@ -379,8 +379,8 @@ describe("extension refresh controller", () => {
 		resetPiStatusLinePatchForTest();
 	});
 
-	test("shrinks status-line filler instead of dropping usage on full-width refresh", async () => {
-		const baseContent = `π > model ${"─".repeat(20)} ctx`;
+	test("shrinks status-line filler and keeps the play marker attached to usage", async () => {
+		const baseContent = `π > model ${"─".repeat(20)} ctx ▶`;
 		class FullStatusLine {
 			getTopBorder(_width: number): { content: string; width: number } {
 				return { content: baseContent, width: baseContent.length };
@@ -411,7 +411,7 @@ describe("extension refresh controller", () => {
 		await controller.flush();
 		const border = new FullStatusLine().getTopBorder(baseContent.length);
 
-		expect(stripAnsi(border.content)).toBe(`π > model > 🪙 5h 42%${"─".repeat(9)} ctx`);
+		expect(stripAnsi(border.content)).toBe(`π > model > 🪙 5h 42%▶${"─".repeat(10)} ctx`);
 		expect(border.width).toBe(baseContent.length);
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
@@ -445,10 +445,9 @@ describe("extension refresh controller", () => {
 		const editor = new Editor();
 		editor.setTopBorder({ content: "π > model ▶", width: "π > model ▶".length });
 		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe("π > model > 🪙 5h 42%▶");
-
-		const fullContent = `π > model ${"─".repeat(20)} ctx`;
+		const fullContent = `π > model ${"─".repeat(20)} ctx ▶`;
 		editor.setTopBorder({ content: fullContent, width: fullContent.length });
-		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model > 🪙 5h 42%${"─".repeat(9)} ctx`);
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model > 🪙 5h 42%▶${"─".repeat(10)} ctx`);
 		expect(editor.topBorder?.width).toBe(fullContent.length);
 
 		expect(statuses.get(STATUS_KEY)).toBeUndefined();
