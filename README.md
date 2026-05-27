@@ -13,6 +13,27 @@ K ⟲ > (sub) ▶ 🪙 5h 9% (↻ 1h53m) / W 36% (↻ 3d8h) ───── sess
 - Shortens filler lines when needed so usage remains visible.
 - Uses warning/critical colors from the OMP theme without adding a background.
 
+## Install
+
+From npm:
+
+```sh
+omp plugin install @oh-my-pi/omp-usage-status
+omp plugin list
+omp plugin doctor
+```
+
+Restart OMP after installation.
+
+From GitHub before the package is published:
+
+```sh
+mkdir -p ~/.omp/plugins
+cd ~/.omp/plugins
+npm install github:zevorn/omp-usage-status
+omp plugin doctor
+```
+
 ## Settings
 
 | Setting | Default | Description |
