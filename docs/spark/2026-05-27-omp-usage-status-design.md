@@ -1,4 +1,4 @@
-# OMP Usage Status Bar Plugin Design
+# OMP Usage Status Plugin Design
 
 ## Context
 
@@ -78,19 +78,19 @@ The plugin is an OMP runtime extension package. It registers event listeners dur
 Example full format:
 
 ```text
-Usage 42% · 5h 1h20m
+🪙 5h 42% (↻ 1h20m)
 ```
 
 ### OpenAI Codex
 
 - Prefer the provider's primary usage window.
 - Use the secondary window when primary is unavailable or exhausted state is reported there.
-- Include the Codex label by default because `Usage` alone is less recognizable outside Claude.
+- Show compact window labels so primary and weekly Codex limits stay distinguishable.
 
 Example full format:
 
 ```text
-Codex 18% · 5h 2h05m
+🪙 5h 18% (↻ 2h05m) / W 35% (↻ 3d8h)
 ```
 
 ### Google Gemini CLI
@@ -102,7 +102,7 @@ Codex 18% · 5h 2h05m
 Example full format:
 
 ```text
-Gemini Pro 63% · resets 23m
+🪙 63% (↻ 23m)
 ```
 
 ### Future providers
@@ -159,9 +159,9 @@ Configuration affects display only. It must not change how OMP authenticates, fe
 
 The renderer should degrade in this order:
 
-1. Full: provider/window/percentage/reset, e.g. `Codex 18% · 5h 2h05m`.
-2. Medium: provider/percentage/reset, e.g. `Codex 18% 2h05m`.
-3. Short: provider/percentage, e.g. `Codex 18%`.
+1. Full: window/percentage/reset, e.g. `🪙 5h 18% (↻ 2h05m) / W 35% (↻ 3d8h)`.
+2. Medium: window/percentage, e.g. `🪙 5h 18% / W 35%`.
+3. Short: primary window/percentage, e.g. `🪙 5h 18%`.
 4. Minimal: percentage only, e.g. `18%`.
 5. Hidden when even the minimal segment cannot fit or would be misleading.
 
