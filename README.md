@@ -1,6 +1,6 @@
 # OMP Usage Status
 
-OMP plugin that appends current-provider usage to the Pi status bar.
+OMP plugin that shows current-provider usage in the Pi status bar.
 
 ```text
 K ⟲ > (sub) ▶ 🪙 5h 9% (↻ 1h53m) / W 36% (↻ 3d8h) ───── session summary
@@ -10,8 +10,9 @@ K ⟲ > (sub) ▶ 🪙 5h 9% (↻ 1h53m) / W 36% (↻ 3d8h) ───── sess
 
 - Shows usage for the active provider/model only.
 - Preserves existing status-line content, including the `▶` marker and session summary.
-- Shortens filler lines when needed so usage remains visible.
-- Uses warning/critical colors from the OMP theme without adding a background.
+- Overlays usage after `▶` only when existing filler has room; otherwise hides usage instead of moving right-side content.
+- Suppresses shutdown-time redraws so `/exit` returns to a clean shell prompt.
+- Uses warning/critical colors from the OMP theme without adding a background to the usage segment.
 
 ## Install
 
@@ -24,6 +25,17 @@ omp plugin doctor
 ```
 
 Restart OMP after installation.
+
+From a local checkout while developing or testing:
+
+```sh
+mkdir -p ~/.omp/plugins
+cd ~/.omp/plugins
+npm install file:../../omp-hud
+omp plugin doctor
+```
+
+The local path above is valid when this repository is checked out at `~/omp-hud`; use an absolute `file:/path/to/omp-hud` URL or adjust the relative path for other checkout locations.
 
 From GitHub before the package is published:
 

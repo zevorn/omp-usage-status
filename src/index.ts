@@ -19,12 +19,14 @@ function getAuthStorage(ctx: ExtensionContext): AuthStorageLike | undefined {
 
 const STATUS_LINE_SEPARATOR = " ";
 const PLAY_STATUS_MARKER = "▶";
-const LEGACY_STATUS_LINE_SEPARATOR = " > ";
 const HORIZONTAL_FILL_CHARS = "─━═╌╍┄┅┈┉-";
+const MIN_PADDING_AFTER_USAGE = 3;
 const ANSI_SEQUENCE_SOURCE = "\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\)|[()][A-Za-z0-9]|[=>])";
+const STARTUP_RETRY_INTERVAL_MS = 250;
+const STARTUP_RETRY_WINDOW_MS = 30_000;
+const ANSI_RESET = "\x1b[0m";
 const ANSI_SEQUENCE_PATTERN = new RegExp(ANSI_SEQUENCE_SOURCE, "g");
 const ANSI_SEQUENCE_STICKY_PATTERN = new RegExp(ANSI_SEQUENCE_SOURCE, "y");
-const TRAILING_PADDING_PATTERN = new RegExp(`(?:[\\t ]|[${HORIZONTAL_FILL_CHARS}]|${ANSI_SEQUENCE_SOURCE})+$`);
 
 interface StatusLinePatchSegment {
 	text: string;
@@ -55,8 +57,8 @@ function statusLineSegment(ctx: ExtensionContext, severity: UsageSeverity, text:
 
 	try {
 		if (typeof theme.getFgAnsi === "function") {
-			segmentText = `${theme.getFgAnsi(token)}${text}\x1b[0m`;
-			separator = `${theme.getFgAnsi("statusLineSep")}${STATUS_LINE_SEPARATOR}\x1b[0m`;
+			segmentText = `${theme.getFgAnsi(token)}${text}${ANSI_RESET}`;
+			separator = `${ANSI_RESET}${theme.getFgAnsi("statusLineSep")}${STATUS_LINE_SEPARATOR}${ANSI_RESET}`;
 		} else {
 			segmentText = foreground(theme, token, text);
 			separator = foreground(theme, "statusLineSep", STATUS_LINE_SEPARATOR);
@@ -82,7 +84,6 @@ type EditorComponentClass = NonNullable<ExtensionAPI["pi"]>["CustomEditor"];
 
 interface StatusLinePatchState {
 	segment: StatusLinePatchSegment | undefined;
-	previousSegment: StatusLinePatchSegment | undefined;
 	text: string | undefined;
 	installed: boolean;
 	editorInstalled: boolean;
@@ -98,7 +99,6 @@ function getStatusLinePatchState(): StatusLinePatchState {
 	const globalState = globalThis as typeof globalThis & { [STATUS_LINE_PATCH_KEY]?: StatusLinePatchState };
 	globalState[STATUS_LINE_PATCH_KEY] ??= {
 		segment: undefined,
-		previousSegment: undefined,
 		text: undefined,
 		installed: false,
 		editorInstalled: false,
@@ -120,31 +120,11 @@ function visibleWidth(text: string): number {
 	return stripAnsi(text).length;
 }
 
-interface SplitStatusLineContent {
-	content: string;
-	width: number;
-	padding: string;
-	paddingWidth: number;
-}
-
 interface SeparatorInsertion {
 	text: string;
 	width: number;
 }
 
-function splitTrailingPadding(content: string, width: number): SplitStatusLineContent {
-	const match = TRAILING_PADDING_PATTERN.exec(content);
-	if (!match) return { content, width, padding: "", paddingWidth: 0 };
-	const padding = match[0];
-	const paddingWidth = visibleWidth(padding);
-	if (paddingWidth === 0) return { content, width, padding: "", paddingWidth: 0 };
-	return {
-		content: content.slice(0, match.index),
-		width: Math.max(0, width - paddingWidth),
-		padding,
-		paddingWidth,
-	};
-}
 
 function removeLeadingVisibleWhitespace(text: string): string {
 	let index = 0;
@@ -161,6 +141,32 @@ function removeLeadingVisibleWhitespace(text: string): string {
 	}
 	return text;
 }
+
+function isHorizontalPaddingChar(char: string | undefined): boolean {
+	return char === " " || char === "\t" || (char !== undefined && HORIZONTAL_FILL_CHARS.includes(char));
+}
+
+interface LeadingHorizontalPadding {
+	width: number;
+	hasFollowingContent: boolean;
+}
+
+function leadingHorizontalPadding(text: string): LeadingHorizontalPadding {
+	let width = 0;
+	for (let index = 0; index < text.length;) {
+		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
+		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(text);
+		if (match) {
+			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
+			continue;
+		}
+		if (!isHorizontalPaddingChar(text[index])) return { width, hasFollowingContent: true };
+		width += 1;
+		index += 1;
+	}
+	return { width, hasFollowingContent: false };
+}
+
 
 function separatorAfter(content: string, segment: StatusLinePatchSegment): SeparatorInsertion {
 	if (!content) return { text: "", width: 0 };
@@ -187,11 +193,6 @@ function removeVisiblePrefix(text: string, width: number): string {
 	return text.slice(index);
 }
 
-function fitPaddingToTarget(padding: string, paddingWidth: number, usedWidth: number, targetWidth: number): { text: string; width: number } {
-	if (!padding || usedWidth + paddingWidth <= targetWidth) return { text: padding, width: paddingWidth };
-	const fitted = removeVisiblePrefix(padding, usedWidth + paddingWidth - targetWidth);
-	return { text: fitted, width: visibleWidth(fitted) };
-}
 function skipAnsiSequences(text: string, index: number): number {
 	while (index < text.length) {
 		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
@@ -207,178 +208,36 @@ function findPlayMarkerInsertion(content: string): number | undefined {
 	return markerIndex < 0 ? undefined : skipAnsiSequences(content, markerIndex + PLAY_STATUS_MARKER.length);
 }
 
-interface ShrunkStatusLineContent {
-	content: string;
-	width: number;
-	removedWidth: number;
-}
 
-function shrinkFillerRun(content: string, width: number, requiredWidth: number): ShrunkStatusLineContent | undefined {
-	if (requiredWidth <= 0) return { content, width, removedWidth: 0 };
-	let bestStart = -1;
-	let bestWidth = 0;
-	let runStart = -1;
-	let runWidth = 0;
-	let runChar = "";
-
-	const finishRun = () => {
-		if (runWidth > bestWidth) {
-			bestStart = runStart;
-			bestWidth = runWidth;
-		}
-		runStart = -1;
-		runWidth = 0;
-		runChar = "";
-	};
-
-	for (let index = 0; index < content.length;) {
-		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
-		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(content);
-		if (match) {
-			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
-			continue;
-		}
-
-		const char = content[index];
-		if (char && HORIZONTAL_FILL_CHARS.includes(char)) {
-			if (runStart >= 0 && char === runChar) {
-				runWidth += 1;
-			} else {
-				finishRun();
-				runStart = index;
-				runWidth = 1;
-				runChar = char;
-			}
-
-		} else {
-			finishRun();
-		}
-		index += 1;
-	}
-	finishRun();
-
-	if (bestStart < 0) return undefined;
-	const removedWidth = Math.min(bestWidth, requiredWidth);
-	return {
-		content: `${content.slice(0, bestStart)}${content.slice(bestStart + removedWidth)}`,
-		width: Math.max(0, width - removedWidth),
-		removedWidth,
-	};
-}
-
-function hasHorizontalFiller(content: string): boolean {
-	for (let index = 0; index < content.length;) {
-		ANSI_SEQUENCE_STICKY_PATTERN.lastIndex = index;
-		const match = ANSI_SEQUENCE_STICKY_PATTERN.exec(content);
-		if (match) {
-			index = ANSI_SEQUENCE_STICKY_PATTERN.lastIndex;
-			continue;
-		}
-		const char = content[index];
-		if (char && HORIZONTAL_FILL_CHARS.includes(char)) return true;
-		index += 1;
-	}
-	return false;
-}
-
-
-interface NormalizedStatusLineContent {
-	content: string;
-	width: number;
-}
-
-function removeKnownUsageSegment(content: string, width: number, segment: StatusLinePatchSegment | undefined): NormalizedStatusLineContent {
-	if (!segment) return { content, width };
-	const segmentIndex = content.indexOf(segment.text);
-	if (segmentIndex < 0) return { content, width };
-
-	let start = segmentIndex;
-	let removedWidth = segment.width;
-	const before = content.slice(0, segmentIndex);
-	if (before.endsWith(LEGACY_STATUS_LINE_SEPARATOR)) {
-		start -= LEGACY_STATUS_LINE_SEPARATOR.length;
-		removedWidth += LEGACY_STATUS_LINE_SEPARATOR.length;
-	} else if (segment.separator && before.endsWith(segment.separator)) {
-		start -= segment.separator.length;
-		removedWidth += segment.separatorWidth;
-	}
-
-	return {
-		content: `${content.slice(0, start)}${content.slice(segmentIndex + segment.text.length)}`,
-		width: Math.max(0, width - removedWidth),
-	};
-}
-
-function removeKnownUsageSegments(content: string, width: number, segment: StatusLinePatchSegment, previousSegment: StatusLinePatchSegment | undefined): NormalizedStatusLineContent {
-	let next = removeKnownUsageSegment(content, width, previousSegment);
-	next = removeKnownUsageSegment(next.content, next.width, segment);
-	return next;
-}
-
-function insertUsageAfterPlayMarker(base: SplitStatusLineContent, maxWidth: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
-	const insertion = findPlayMarkerInsertion(base.content);
+function overlayUsageAfterPlayMarker(content: string, width: number, segment: StatusLinePatchSegment): StatusLineBorderLike | undefined {
+	const insertion = findPlayMarkerInsertion(content);
 	if (insertion === undefined) return undefined;
-	const prefix = base.content.slice(0, insertion);
-	let tail = base.content.slice(insertion);
-	const prefixWidth = visibleWidth(prefix);
-	let tailWidth = visibleWidth(tail);
+	const prefix = content.slice(0, insertion);
+	const tail = content.slice(insertion);
 	const separator = separatorAfter(prefix, segment);
-	let padding = { text: base.padding, width: base.paddingWidth };
-	let totalWidth = prefixWidth + separator.width + segment.width + tailWidth + padding.width;
-
-	if (maxWidth > 0 && totalWidth > maxWidth && padding.width > 0) {
-		padding = fitPaddingToTarget(padding.text, padding.width, totalWidth - padding.width, maxWidth);
-		totalWidth = prefixWidth + separator.width + segment.width + tailWidth + padding.width;
-	}
-
-	if (maxWidth > 0 && totalWidth > maxWidth) {
-		const shrunk = shrinkFillerRun(tail, tailWidth, totalWidth - maxWidth);
-		if (!shrunk) return undefined;
-		tail = shrunk.content;
-		tailWidth = shrunk.width;
-		totalWidth -= shrunk.removedWidth;
-		if (totalWidth > maxWidth) return undefined;
-	}
-
-	return {
-		content: `${prefix}${separator.text}${segment.text}${tail}${padding.text}`,
-		width: totalWidth,
-	};
-}
-
-function appendUsageToTopBorder(border: StatusLineBorderLike, maxWidth: number, segment: StatusLinePatchSegment, previousSegment?: StatusLinePatchSegment): StatusLineBorderLike {
-	const content = typeof border.content === "string" ? border.content : "";
-	const rawBaseWidth = typeof border.width === "number" && Number.isFinite(border.width) ? border.width : visibleWidth(content);
-	const normalized = removeKnownUsageSegments(content, rawBaseWidth, segment, previousSegment);
-	let base = splitTrailingPadding(normalized.content, normalized.width);
-	const markerInserted = insertUsageAfterPlayMarker(base, maxWidth, segment);
-	if (markerInserted) return markerInserted;
-	let separator = separatorAfter(base.content, segment);
-	let usageWidth = base.width + separator.width + segment.width;
-
-	if (maxWidth > 0 && usageWidth > maxWidth) {
-		const shrunk = shrinkFillerRun(base.content, base.width, usageWidth - maxWidth);
-		if (!shrunk) return border;
-		base = { ...base, content: shrunk.content, width: shrunk.width };
-		separator = separatorAfter(base.content, segment);
-		usageWidth = base.width + separator.width + segment.width;
-		if (usageWidth > maxWidth) return border;
-	}
-
-	if (maxWidth > 0) {
-		if (usageWidth > maxWidth) return border;
-		const padding = fitPaddingToTarget(base.padding, base.paddingWidth, usageWidth, maxWidth);
+	const overlayWidth = separator.width + segment.width + segment.separatorWidth;
+	const padding = leadingHorizontalPadding(tail);
+	if (!padding.hasFollowingContent && padding.width === 0) {
 		return {
-			content: `${base.content}${separator.text}${segment.text}${padding.text}`,
-			width: usageWidth + padding.width,
+			content: `${prefix}${separator.text}${segment.text}${segment.separator}`,
+			width: width + overlayWidth,
 		};
 	}
-
+	const requiredPadding = overlayWidth + (padding.hasFollowingContent ? MIN_PADDING_AFTER_USAGE : 0);
+	if (padding.width < requiredPadding) return undefined;
 	return {
-		content: `${base.content}${separator.text}${segment.text}${base.padding}`,
-		width: usageWidth + base.paddingWidth,
+		content: `${prefix}${separator.text}${segment.text}${segment.separator}${removeVisiblePrefix(tail, overlayWidth)}`,
+		width,
 	};
 }
+
+function overlayUsageToTopBorder(border: StatusLineBorderLike, segment: StatusLinePatchSegment): StatusLineBorderLike {
+	const content = typeof border.content === "string" ? border.content : "";
+	const width = typeof border.width === "number" && Number.isFinite(border.width) ? border.width : visibleWidth(content);
+	return overlayUsageAfterPlayMarker(content, width, segment) ?? border;
+}
+
+
 function plainStatusLineSegment(text: string): StatusLinePatchSegment {
 	return {
 		text,
@@ -407,7 +266,7 @@ function installStatusLineComponentPatch(pi: ExtensionAPI): boolean {
 		const border = original.call(this, width);
 		const segment = getCurrentStatusLineSegment(state);
 		if (!border || !segment) return border ?? { content: "", width: 0 };
-		return appendUsageToTopBorder(border, width, segment, state.previousSegment);
+		return overlayUsageToTopBorder(border, segment);
 	};
 
 	state.component = component;
@@ -416,6 +275,18 @@ function installStatusLineComponentPatch(pi: ExtensionAPI): boolean {
 	prototype.getTopBorder = patched;
 	state.installed = true;
 	return true;
+}
+
+function restoreEditorTopBorderPatch(state: StatusLinePatchState): void {
+	const editorComponent = state.editorComponent;
+	if (state.editorInstalled && editorComponent && state.editorOriginal) {
+		const prototype = editorComponent.prototype;
+		if (prototype && prototype.setTopBorder === state.editorPatched) prototype.setTopBorder = state.editorOriginal;
+	}
+	state.editorInstalled = false;
+	state.editorComponent = undefined;
+	state.editorOriginal = undefined;
+	state.editorPatched = undefined;
 }
 
 function installEditorTopBorderPatch(pi: ExtensionAPI): boolean {
@@ -429,7 +300,7 @@ function installEditorTopBorderPatch(pi: ExtensionAPI): boolean {
 	const original = current === state.editorPatched && state.editorOriginal ? state.editorOriginal : current;
 	const patched = function patchedSetTopBorder(this: unknown, content: StatusLineBorderLike | undefined): void {
 		const segment = getCurrentStatusLineSegment(state);
-		const next = content && segment ? appendUsageToTopBorder(content, hasHorizontalFiller(content.content) ? content.width : 0, segment, state.previousSegment) : content;
+		const next = content && segment ? overlayUsageToTopBorder(content, segment) : content;
 		original.call(this, next);
 	};
 
@@ -443,18 +314,24 @@ function installEditorTopBorderPatch(pi: ExtensionAPI): boolean {
 
 export function installPiStatusLinePatch(pi: ExtensionAPI): boolean {
 	const statusLineInstalled = installStatusLineComponentPatch(pi);
-	const editorInstalled = installEditorTopBorderPatch(pi);
-	return statusLineInstalled || editorInstalled;
+	if (statusLineInstalled) {
+		restoreEditorTopBorderPatch(getStatusLinePatchState());
+		return true;
+	}
+	return installEditorTopBorderPatch(pi);
 }
 
 function setPiStatusLineSegment(segment: StatusLinePatchSegment | undefined): boolean {
 	const state = getStatusLinePatchState();
-	if (!segment) state.previousSegment = undefined;
-	if (segment && state.segment && state.segment.text !== segment.text) state.previousSegment = state.segment;
 	state.segment = segment;
 	state.text = segment?.text;
 	return state.installed || state.editorInstalled;
 }
+
+function requestStatusLineRender(ctx: ExtensionContext): void {
+	ctx.ui.setStatus(STATUS_KEY, "");
+}
+
 
 export function resetPiStatusLinePatchForTest(): void {
 	const state = getStatusLinePatchState();
@@ -463,28 +340,22 @@ export function resetPiStatusLinePatchForTest(): void {
 		const prototype = component.prototype;
 		if (prototype && prototype.getTopBorder === state.patched) prototype.getTopBorder = state.original;
 	}
-	const editorComponent = state.editorComponent;
-	if (state.editorInstalled && editorComponent && state.editorOriginal) {
-		const prototype = editorComponent.prototype;
-		if (prototype && prototype.setTopBorder === state.editorPatched) prototype.setTopBorder = state.editorOriginal;
-	}
+	restoreEditorTopBorderPatch(state);
 	state.segment = undefined;
-	state.previousSegment = undefined;
 	state.text = undefined;
 	state.installed = false;
-	state.editorInstalled = false;
 	state.component = undefined;
-	state.editorComponent = undefined;
 	state.original = undefined;
 	state.patched = undefined;
-	state.editorOriginal = undefined;
-	state.editorPatched = undefined;
 }
 
 export class UsageStatusController {
 	#config: UsageStatusConfig = { ...DEFAULT_CONFIG };
 	#timer: ReturnType<typeof setInterval> | undefined;
+	#startupRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	#startupRetryUntil = 0;
 	#refreshInFlight: Promise<void> | undefined;
+	#generation = 0;
 	#dirty = false;
 	#lastContext: ExtensionContext | undefined;
 	#disposed = false;
@@ -493,20 +364,28 @@ export class UsageStatusController {
 	constructor(private readonly logger?: { debug?: (message: string, meta?: Record<string, unknown>) => void; warn?: (message: string, meta?: Record<string, unknown>) => void }) {}
 
 	async start(ctx: ExtensionContext): Promise<void> {
+		this.#generation += 1;
+		const generation = this.#generation;
 		this.#disposed = false;
 		this.#lastContext = ctx;
-		this.#config = await loadUsageStatusConfig(ctx.cwd, PLUGIN_NAME);
+		const config = await loadUsageStatusConfig(ctx.cwd, PLUGIN_NAME);
+		if (this.#disposed || generation !== this.#generation) return;
+		this.#config = config;
+		this.#cancelStartupRetry();
+		this.#startupRetryUntil = Date.now() + STARTUP_RETRY_WINDOW_MS;
 		this.#restartTimer();
 		this.schedule(ctx, "start");
 	}
 
-	dispose(ctx?: ExtensionContext): void {
+	dispose(ctx?: ExtensionContext, options?: { render?: boolean }): void {
 		this.#disposed = true;
+		this.#generation += 1;
+		this.#cancelStartupRetry();
 		if (this.#timer) {
 			clearInterval(this.#timer);
 			this.#timer = undefined;
 		}
-		this.#clear(ctx ?? this.#lastContext);
+		this.#clear(ctx ?? this.#lastContext, options);
 	}
 
 	schedule(ctx: ExtensionContext, reason: string): void {
@@ -520,16 +399,25 @@ export class UsageStatusController {
 			this.#dirty = true;
 			return;
 		}
-		this.#refreshInFlight = this.#refresh(ctx, reason)
+		const generation = this.#generation;
+		let retryStartup = false;
+		this.#refreshInFlight = this.#refresh(ctx, reason, generation)
+			.then(ready => {
+				retryStartup = !ready && generation === this.#generation && !this.#disposed;
+			})
 			.catch(error => {
-				this.logger?.warn?.("Usage status refresh failed", { error: String(error), reason });
+				if (!this.#disposed && generation === this.#generation) {
+					this.logger?.warn?.("Usage status refresh failed", { error: String(error), reason });
+				}
 			})
 			.finally(() => {
 				this.#refreshInFlight = undefined;
 				if (this.#dirty && !this.#disposed && this.#lastContext) {
 					this.#dirty = false;
 					this.schedule(this.#lastContext, "dirty");
+					return;
 				}
+				if (retryStartup) this.#scheduleStartupRetry(ctx, generation);
 			});
 	}
 
@@ -537,32 +425,36 @@ export class UsageStatusController {
 		await this.#refreshInFlight;
 	}
 
-	async #refresh(ctx: ExtensionContext, reason: string): Promise<void> {
-		if (!ctx.hasUI) return;
+	async #refresh(ctx: ExtensionContext, reason: string, generation: number): Promise<boolean> {
+		if (this.#disposed || generation !== this.#generation) return true;
+		if (!ctx.hasUI) return true;
 		const model = ctx.model;
 		if (!model) {
 			this.logger?.debug?.("Usage status refresh skipped; active model unavailable", { reason });
-			return;
+			return false;
 		}
 
 		const authStorage = getAuthStorage(ctx);
 		if (typeof authStorage?.fetchUsageReports !== "function") {
 			this.logger?.debug?.("Usage reports unavailable from OMP runtime", { reason });
-			return;
+			return false;
 		}
 
 		const reports = await authStorage.fetchUsageReports({
 			baseUrlResolver: provider => (provider === model.provider ? model.baseUrl : undefined),
 		});
+		if (this.#disposed || generation !== this.#generation) return true;
 		if (reports == null) {
 			this.logger?.debug?.("Usage reports unavailable from OMP runtime", { reason });
-			return;
+			return false;
 		}
 		const rendered = renderUsageForModel(reports, model, this.#config, RENDER_WIDTH);
-		this.#set(ctx, rendered);
+		this.#set(ctx, rendered, generation);
+		return true;
 	}
 
-	#set(ctx: ExtensionContext, rendered: RenderedUsage | undefined): void {
+	#set(ctx: ExtensionContext, rendered: RenderedUsage | undefined, generation: number): void {
+		if (this.#disposed || generation !== this.#generation) return;
 		if (!rendered) {
 			this.#clear(ctx);
 			return;
@@ -576,14 +468,14 @@ export class UsageStatusController {
 			return;
 		}
 		this.#lastText = cacheKey;
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		this.#cancelStartupRetry();
+		requestStatusLineRender(ctx);
 	}
 
-	#clear(ctx: ExtensionContext | undefined): void {
-		if (!ctx) return;
+	#clear(ctx: ExtensionContext | undefined, options?: { render?: boolean }): void {
 		this.#lastText = undefined;
 		setPiStatusLineSegment(undefined);
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		if (ctx && options?.render !== false) requestStatusLineRender(ctx);
 	}
 
 	#restartTimer(): void {
@@ -596,6 +488,21 @@ export class UsageStatusController {
 			if (this.#lastContext) this.schedule(this.#lastContext, "timer");
 		}, this.#config.refreshIntervalMs);
 		(this.#timer as { unref?: () => void }).unref?.();
+	}
+
+	#scheduleStartupRetry(ctx: ExtensionContext, generation: number): void {
+		if (this.#disposed || generation !== this.#generation || this.#startupRetryTimer || this.#lastText || Date.now() >= this.#startupRetryUntil) return;
+		this.#startupRetryTimer = setTimeout(() => {
+			this.#startupRetryTimer = undefined;
+			if (!this.#disposed && generation === this.#generation) this.schedule(ctx, "startup_retry");
+		}, STARTUP_RETRY_INTERVAL_MS);
+		(this.#startupRetryTimer as { unref?: () => void }).unref?.();
+	}
+
+	#cancelStartupRetry(): void {
+		if (!this.#startupRetryTimer) return;
+		clearTimeout(this.#startupRetryTimer);
+		this.#startupRetryTimer = undefined;
 	}
 }
 
@@ -636,6 +543,6 @@ export default function usageStatusBarExtension(pi: ExtensionAPI): void {
 		controller.schedule(ctx, "auto_retry_end");
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
-		controller.dispose(ctx);
+		controller.dispose(ctx, { render: false });
 	});
 }

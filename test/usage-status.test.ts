@@ -91,10 +91,13 @@ function report(provider: string, limits: UsageLimit[], fetchedAt = Date.now()):
 	return { provider, fetchedAt, limits };
 }
 
+
+const STATUS_LINE_TEST_PADDING = " ".repeat(20);
+
 function installFakeStatusLine(): { new(): { getTopBorder(width: number): { content: string; width: number } } } {
 	class FakeStatusLine {
 		getTopBorder(_width: number): { content: string; width: number } {
-			const content = "π > model ▶";
+			const content = `π > model ▶${STATUS_LINE_TEST_PADDING}`;
 			return { content, width: content.length };
 		}
 	}
@@ -110,7 +113,7 @@ function installFakeStatusLineAndEditor(): {
 } {
 	class FakeStatusLine {
 		getTopBorder(_width: number): { content: string; width: number } {
-			const content = "π > model ▶";
+			const content = `π > model ▶${STATUS_LINE_TEST_PADDING}`;
 			return { content, width: content.length };
 		}
 	}
@@ -367,20 +370,152 @@ describe("extension refresh controller", () => {
 		await controller.flush();
 
 		expect(fetchCount).toBe(2);
-		expect(statuses.get(STATUS_KEY)).toBeUndefined();
+		expect(statuses.get(STATUS_KEY)).toBe("");
 		const border = new StatusLine().getTopBorder(80);
-		expect(stripAnsi(border.content)).toBe("π > model ▶ 🪙 5h 42%");
+		expect(stripAnsi(border.content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
 		expect(border.content).not.toContain(bgAnsi);
 		expect(border.content).toContain(`${sepAnsi} \x1b[0m`);
 		expect(border.content).toContain(`${spendAnsi}🪙 5h 42%\x1b[0m`);
-		expect(border.width).toBe("π > model ▶ 🪙 5h 42%".length);
+		expect(border.width).toBe(`π > model ▶${STATUS_LINE_TEST_PADDING}`.length);
 		controller.dispose(ctx);
-		expect(statuses.get(STATUS_KEY)).toBeUndefined();
+		expect(statuses.get(STATUS_KEY)).toBe("");
 		expect(new StatusLine().getTopBorder(80).content).not.toContain("42%");
 		resetPiStatusLinePatchForTest();
 	});
 
-	test("normalizes stale interactive usage on every refresh without moving the play marker", async () => {
+	test("retries startup refresh until the active model is available", async () => {
+		let fetchCount = 0;
+		const StatusLine = installFakeStatusLine();
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: undefined as Model | undefined,
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						fetchCount += 1;
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus() {},
+				theme: { fg: (_token: string, text: string) => text },
+			},
+		};
+		const controller = new UsageStatusController();
+
+		await controller.start(ctx as never);
+		await controller.flush();
+		expect(fetchCount).toBe(0);
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶${STATUS_LINE_TEST_PADDING}`);
+
+		ctx.model = model("anthropic", "claude-sonnet-4-5");
+		await new Promise(resolve => setTimeout(resolve, 300));
+		await controller.flush();
+		expect(fetchCount).toBe(1);
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
+		controller.dispose(ctx as never);
+		resetPiStatusLinePatchForTest();
+	});
+	test("shutdown ignores in-flight refreshes without forcing a final render", async () => {
+		let fetchCount = 0;
+		let releaseFetch: (() => void) | undefined;
+		const fetchGate = new Promise<void>(resolve => {
+			releaseFetch = resolve;
+		});
+		const statuses: Array<[string, string | undefined]> = [];
+		const StatusLine = installFakeStatusLine();
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						fetchCount += 1;
+						await fetchGate;
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus(key: string, text: string | undefined) {
+					statuses.push([key, text]);
+				},
+				theme: { fg: (_token: string, text: string) => text },
+			},
+		} as never;
+		const controller = new UsageStatusController();
+
+		controller.schedule(ctx, "slow-refresh");
+		expect(fetchCount).toBe(1);
+		controller.dispose(ctx, { render: false });
+		releaseFetch?.();
+		await controller.flush();
+
+		expect(statuses.length).toBe(0);
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶${STATUS_LINE_TEST_PADDING}`);
+		resetPiStatusLinePatchForTest();
+	});
+
+	test("session switch ignores stale in-flight refreshes from the previous generation", async () => {
+		let releaseOldFetch: (() => void) | undefined;
+		const oldFetchGate = new Promise<void>(resolve => {
+			releaseOldFetch = resolve;
+		});
+		let setStatusCount = 0;
+		const StatusLine = installFakeStatusLine();
+		const ui = {
+			setStatus() {
+				setStatusCount += 1;
+			},
+			theme: { fg: (_token: string, text: string) => text },
+		};
+		const oldCtx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						await oldFetchGate;
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.21, windowId: "5h" })])];
+					},
+				},
+			},
+			ui,
+		} as never;
+		const newCtx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui,
+		} as never;
+		const controller = new UsageStatusController();
+
+		controller.schedule(oldCtx, "old-refresh");
+		controller.dispose(oldCtx, { render: false });
+		await controller.start(newCtx);
+		releaseOldFetch?.();
+		await controller.flush();
+		await controller.flush();
+
+		expect(setStatusCount).toBe(1);
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
+		controller.dispose(newCtx, { render: false });
+		resetPiStatusLinePatchForTest();
+	});
+
+
+	test("appends usage with no right side and hides when right-side padding is insufficient", async () => {
 		let fraction = 0.41;
 		let baseContent = "π > model ▶";
 		class InteractiveStatusLine {
@@ -411,29 +546,26 @@ describe("extension refresh controller", () => {
 
 		controller.schedule(ctx, "initial");
 		await controller.flush();
-		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 41%");
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 41% ");
 
-		baseContent = "π > model ▶ > 🪙 5h 41%";
+
+		baseContent = "π > model ▶── right";
 		fraction = 0.42;
-		controller.schedule(ctx, "refresh");
+		controller.schedule(ctx, "tight-right-side");
 		await controller.flush();
-		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶── right");
 
-		baseContent = "π > model ▶ > 🪙 5h 42%";
-		controller.schedule(ctx, "same-render");
-		await controller.flush();
-		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
-
+		fraction = 0.42;
 		baseContent = `π > model ▶${" ".repeat(20)}`;
 		controller.schedule(ctx, "padded-marker");
 		await controller.flush();
-		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(20)}`);
+		expect(stripAnsi(new InteractiveStatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
 
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
 	});
 
-	test("shrinks filler so usage follows the play marker when the status line is full", async () => {
+	test("overlays usage after the play marker without moving the rendered right side", async () => {
 		const baseContent = `π > model ${"─".repeat(20)} ctx ▶`;
 		class FullStatusLine {
 			getTopBorder(_width: number): { content: string; width: number } {
@@ -466,10 +598,10 @@ describe("extension refresh controller", () => {
 		const border = new FullStatusLine().getTopBorder(baseContent.length);
 
 		const wideBorder = new FullStatusLine().getTopBorder(80);
-		expect(stripAnsi(wideBorder.content)).toBe(`${baseContent} 🪙 5h 42%`);
+		expect(stripAnsi(wideBorder.content)).toBe(`${baseContent} 🪙 5h 42% `);
 
-		expect(stripAnsi(border.content)).toBe(`π > model ${"─".repeat(10)} ctx ▶ 🪙 5h 42%`);
-		expect(border.width).toBe(baseContent.length);
+		expect(stripAnsi(border.content)).toBe(`${baseContent} 🪙 5h 42% `);
+		expect(border.width).toBe(`${baseContent} 🪙 5h 42% `.length);
 
 		const asciiDashContent = `π > model ${"-".repeat(20)} ctx ▶`;
 		class AsciiDashStatusLine {
@@ -484,8 +616,8 @@ describe("extension refresh controller", () => {
 		asciiDashController.schedule(ctx, "ascii-dash");
 		await asciiDashController.flush();
 		const asciiDashBorder = new AsciiDashStatusLine().getTopBorder(asciiDashContent.length);
-		expect(stripAnsi(asciiDashBorder.content)).toBe(`π > model ${"-".repeat(10)} ctx ▶ 🪙 5h 42%`);
-		expect(asciiDashBorder.width).toBe(asciiDashContent.length);
+		expect(stripAnsi(asciiDashBorder.content)).toBe(`${asciiDashContent} 🪙 5h 42% `);
+		expect(asciiDashBorder.width).toBe(`${asciiDashContent} 🪙 5h 42% `.length);
 		asciiDashController.dispose(ctx);
 
 		const afterMarkerDashContent = `π > model ▶ ${"─".repeat(20)} ctx`;
@@ -504,13 +636,70 @@ describe("extension refresh controller", () => {
 		expect(stripAnsi(afterMarkerDashBorder.content)).toBe(`π > model ▶ 🪙 5h 42% ${"─".repeat(10)} ctx`);
 		expect(afterMarkerDashBorder.width).toBe(afterMarkerDashContent.length);
 		afterMarkerDashController.dispose(ctx);
+
+		const summaryBgAnsi = "\x1b[48;2;10;20;30m";
+		const summarySpendAnsi = "\x1b[38;2;40;50;60m";
+		const summarySepAnsi = "\x1b[38;2;70;80;90m";
+		const summaryResetAnsi = "\x1b[0m";
+		let summaryContent = `π > model ▶ ${summaryBgAnsi}${"─".repeat(13)} session summary${"─".repeat(13)}${summaryResetAnsi}`;
+		let summaryWidth = stripAnsi(summaryContent).length;
+		class SummaryStatusLine {
+			getTopBorder(_width: number): { content: string; width: number } {
+				return { content: summaryContent, width: summaryWidth };
+			}
+		}
+		resetPiStatusLinePatchForTest();
+		const summaryInstalled = installPiStatusLinePatch({ pi: { StatusLineComponent: SummaryStatusLine } } as never);
+		expect(summaryInstalled).toBe(true);
+		const summaryController = new UsageStatusController();
+		const summaryCtx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus() {},
+				theme: {
+					fg: (_token: string, text: string) => text,
+					getBgAnsi(token: string) {
+						assert.equal(token, "statusLineBg");
+						return summaryBgAnsi;
+					},
+					getFgAnsi(token: string) {
+						if (token === "statusLineSpend") return summarySpendAnsi;
+						if (token === "statusLineSep") return summarySepAnsi;
+						throw new Error(`unexpected token ${token}`);
+					},
+				},
+			},
+		} as never;
+		summaryController.schedule(summaryCtx, "session-summary");
+		await summaryController.flush();
+		const summaryBorder = new SummaryStatusLine().getTopBorder(summaryWidth);
+		expect(stripAnsi(summaryBorder.content)).toBe(`π > model ▶ 🪙 5h 42% ${"─".repeat(3)} session summary${"─".repeat(13)}`);
+		expect(summaryBorder.content).not.toContain(`${summaryBgAnsi}🪙`);
+		expect(summaryBorder.width).toBe(summaryWidth);
+
+		summaryContent = `π > model ▶ ${summaryBgAnsi}${"─".repeat(9)} session summary${"─".repeat(13)}${summaryResetAnsi}`;
+		summaryWidth = stripAnsi(summaryContent).length;
+		const tightSummaryBorder = new SummaryStatusLine().getTopBorder(summaryWidth);
+		expect(stripAnsi(tightSummaryBorder.content)).toBe(`π > model ▶ ${"─".repeat(9)} session summary${"─".repeat(13)}`);
+		expect(tightSummaryBorder.content).not.toContain("🪙");
+		expect(tightSummaryBorder.width).toBe(summaryWidth);
+		summaryController.dispose(summaryCtx);
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
 	});
 
-	test("editor top-border refresh keeps usage segment attached", async () => {
+	test("real top-border render chain applies usage exactly once", async () => {
 		const statuses = new Map<string, string | undefined>();
-		const { Editor } = installFakeStatusLineAndEditor();
+		const { StatusLine, Editor } = installFakeStatusLineAndEditor();
 		const ctx = {
 			hasUI: true,
 			cwd: process.cwd(),
@@ -534,14 +723,61 @@ describe("extension refresh controller", () => {
 		controller.schedule(ctx, "initial");
 		await controller.flush();
 		const editor = new Editor();
-		editor.setTopBorder({ content: "π > model ▶", width: "π > model ▶".length });
-		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe("π > model ▶ 🪙 5h 42%");
-		const fullContent = `π > model ${"─".repeat(20)} ctx ▶`;
-		editor.setTopBorder({ content: fullContent, width: fullContent.length });
-		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model ${"─".repeat(10)} ctx ▶ 🪙 5h 42%`);
-		expect(editor.topBorder?.width).toBe(fullContent.length);
+		const border = new StatusLine().getTopBorder(80);
+		editor.setTopBorder(border);
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
+		expect(editor.topBorder?.content.match(/🪙/g)?.length).toBe(1);
+		expect(editor.topBorder?.width).toBe(`π > model ▶${STATUS_LINE_TEST_PADDING}`.length);
 
-		expect(statuses.get(STATUS_KEY)).toBeUndefined();
+		const bareContent = `π > model ▶${STATUS_LINE_TEST_PADDING}`;
+		editor.setTopBorder({ content: bareContent, width: bareContent.length });
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(bareContent);
+		expect(editor.topBorder?.width).toBe(bareContent.length);
+
+		expect(statuses.get(STATUS_KEY)).toBe("");
+		controller.dispose(ctx);
+		resetPiStatusLinePatchForTest();
+	});
+
+	test("editor fallback overlays only when no status-line component exists", async () => {
+		class FallbackEditor {
+			topBorder: { content: string; width: number } | undefined;
+
+			setTopBorder(content: { content: string; width: number } | undefined): void {
+				this.topBorder = content;
+			}
+		}
+		resetPiStatusLinePatchForTest();
+		const installed = installPiStatusLinePatch({ pi: { CustomEditor: FallbackEditor } } as never);
+		expect(installed).toBe(true);
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus() {},
+				theme: { fg: (_token: string, text: string) => text },
+			},
+		} as never;
+		const controller = new UsageStatusController();
+
+		controller.schedule(ctx, "initial");
+		await controller.flush();
+		const editor = new FallbackEditor();
+		editor.setTopBorder({ content: "π > model ▶", width: "π > model ▶".length });
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe("π > model ▶ 🪙 5h 42% ");
+
+		const paddedContent = `π > model ▶${STATUS_LINE_TEST_PADDING}`;
+		editor.setTopBorder({ content: paddedContent, width: paddedContent.length });
+		expect(stripAnsi(editor.topBorder?.content ?? "")).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
+		expect(editor.topBorder?.width).toBe(paddedContent.length);
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
 	});
@@ -573,14 +809,14 @@ describe("extension refresh controller", () => {
 
 		controller.schedule(ctx, "initial");
 		await controller.flush();
-		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
 
 		fail = true;
 		controller.schedule(ctx, "failure");
 		await controller.flush();
 
-		expect(statuses.get(STATUS_KEY)).toBeUndefined();
-		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe("π > model ▶ 🪙 5h 42%");
+		expect(statuses.get(STATUS_KEY)).toBe("");
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
 		controller.dispose(ctx);
 		resetPiStatusLinePatchForTest();
 	});
