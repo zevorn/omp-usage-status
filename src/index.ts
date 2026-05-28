@@ -367,18 +367,24 @@ export class UsageStatusController {
 		this.#generation += 1;
 		const generation = this.#generation;
 		this.#disposed = false;
+		this.#refreshInFlight = undefined;
+		this.#dirty = false;
 		this.#lastContext = ctx;
 		const config = await loadUsageStatusConfig(ctx.cwd, PLUGIN_NAME);
 		if (this.#disposed || generation !== this.#generation) return;
 		this.#config = config;
+		this.#lastText = undefined;
 		this.#cancelStartupRetry();
 		this.#startupRetryUntil = Date.now() + STARTUP_RETRY_WINDOW_MS;
 		this.#restartTimer();
 		this.schedule(ctx, "start");
+		await this.flush();
 	}
 
 	dispose(ctx?: ExtensionContext, options?: { render?: boolean }): void {
 		this.#disposed = true;
+		this.#refreshInFlight = undefined;
+		this.#dirty = false;
 		this.#generation += 1;
 		this.#cancelStartupRetry();
 		if (this.#timer) {
@@ -401,7 +407,7 @@ export class UsageStatusController {
 		}
 		const generation = this.#generation;
 		let retryStartup = false;
-		this.#refreshInFlight = this.#refresh(ctx, reason, generation)
+		const refresh = this.#refresh(ctx, reason, generation)
 			.then(ready => {
 				retryStartup = !ready && generation === this.#generation && !this.#disposed;
 			})
@@ -411,6 +417,7 @@ export class UsageStatusController {
 				}
 			})
 			.finally(() => {
+				if (this.#refreshInFlight !== refresh) return;
 				this.#refreshInFlight = undefined;
 				if (this.#dirty && !this.#disposed && this.#lastContext) {
 					this.#dirty = false;
@@ -419,6 +426,7 @@ export class UsageStatusController {
 				}
 				if (retryStartup) this.#scheduleStartupRetry(ctx, generation);
 			});
+		this.#refreshInFlight = refresh;
 	}
 
 	async flush(): Promise<void> {

@@ -418,6 +418,59 @@ describe("extension refresh controller", () => {
 		controller.dispose(ctx as never);
 		resetPiStatusLinePatchForTest();
 	});
+	test("start waits for the initial usage refresh before returning", async () => {
+		let releaseFetch: (() => void) | undefined;
+		let markFetchStarted: (() => void) | undefined;
+		const fetchStarted = new Promise<void>(resolve => {
+			markFetchStarted = resolve;
+		});
+		const fetchGate = new Promise<void>(resolve => {
+			releaseFetch = resolve;
+		});
+		const statuses: Array<[string, string | undefined]> = [];
+		const StatusLine = installFakeStatusLine();
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			model: model("anthropic", "claude-sonnet-4-5"),
+			modelRegistry: {
+				authStorage: {
+					async fetchUsageReports() {
+						markFetchStarted?.();
+						await fetchGate;
+						return [report("anthropic", [limit({ id: "anthropic:5h", provider: "anthropic", fraction: 0.42, windowId: "5h" })])];
+					},
+				},
+			},
+			ui: {
+				setStatus(key: string, text: string | undefined) {
+					statuses.push([key, text]);
+				},
+				theme: { fg: (_token: string, text: string) => text },
+			},
+		} as never;
+		const controller = new UsageStatusController();
+		let resolved = false;
+
+		const started = controller.start(ctx).then(() => {
+			resolved = true;
+		});
+		await fetchStarted;
+		expect(resolved).toBe(false);
+		expect(statuses.length).toBe(0);
+
+		releaseFetch?.();
+		await started;
+
+		expect(resolved).toBe(true);
+		expect(statuses.length).toBe(1);
+		await controller.start(ctx);
+		expect(statuses.length).toBe(2);
+		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶ 🪙 5h 42%${" ".repeat(10)}`);
+		controller.dispose(ctx);
+		resetPiStatusLinePatchForTest();
+	});
+
 	test("shutdown ignores in-flight refreshes without forcing a final render", async () => {
 		let fetchCount = 0;
 		let releaseFetch: (() => void) | undefined;
@@ -452,7 +505,7 @@ describe("extension refresh controller", () => {
 		expect(fetchCount).toBe(1);
 		controller.dispose(ctx, { render: false });
 		releaseFetch?.();
-		await controller.flush();
+		await Promise.resolve();
 
 		expect(statuses.length).toBe(0);
 		expect(stripAnsi(new StatusLine().getTopBorder(80).content)).toBe(`π > model ▶${STATUS_LINE_TEST_PADDING}`);
@@ -505,7 +558,7 @@ describe("extension refresh controller", () => {
 		controller.dispose(oldCtx, { render: false });
 		await controller.start(newCtx);
 		releaseOldFetch?.();
-		await controller.flush();
+		await Promise.resolve();
 		await controller.flush();
 
 		expect(setStatusCount).toBe(1);
