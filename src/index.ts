@@ -25,6 +25,10 @@ const ANSI_SEQUENCE_SOURCE = "\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|
 const STARTUP_RETRY_INTERVAL_MS = 250;
 const STARTUP_RETRY_WINDOW_MS = 30_000;
 const ANSI_RESET = "\x1b[0m";
+const EXIT_INPUT_GUARD_CTRL_C_WINDOW_MS = 1_500;
+const EXIT_INPUT_GUARD_MAX_BUFFER = 64;
+const CTRL_C = "\x03";
+const INPUT_TEXT_DECODER = new TextDecoder();
 const ANSI_SEQUENCE_PATTERN = new RegExp(ANSI_SEQUENCE_SOURCE, "g");
 const ANSI_SEQUENCE_STICKY_PATTERN = new RegExp(ANSI_SEQUENCE_SOURCE, "y");
 
@@ -328,6 +332,144 @@ function setPiStatusLineSegment(segment: StatusLinePatchSegment | undefined): bo
 	return state.installed || state.editorInstalled;
 }
 
+interface UsageStatusInputExitDetector {
+	handle(chunk: unknown): void;
+	dispose(): void;
+}
+
+function inputChunkToString(chunk: unknown): string {
+	if (typeof chunk === "string") return chunk;
+	if (chunk instanceof Uint8Array) return INPUT_TEXT_DECODER.decode(chunk);
+	return "";
+}
+
+function isExitCommandLine(line: string): boolean {
+	const command = line.trim();
+	return command === "/exit" || command.startsWith("/exit ");
+}
+
+export function createUsageStatusInputExitDetector(onExit: () => void, ctrlCWindowMs = EXIT_INPUT_GUARD_CTRL_C_WINDOW_MS): UsageStatusInputExitDetector {
+	let line = "";
+	let ctrlCCount = 0;
+	let ctrlCTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const resetCtrlC = (): void => {
+		ctrlCCount = 0;
+		if (!ctrlCTimer) return;
+		clearTimeout(ctrlCTimer);
+		ctrlCTimer = undefined;
+	};
+	const triggerExit = (): void => {
+		line = "";
+		resetCtrlC();
+		onExit();
+	};
+
+	return {
+		handle(chunk: unknown): void {
+			const text = inputChunkToString(chunk);
+			for (const char of text) {
+				if (char === CTRL_C) {
+					ctrlCCount += 1;
+					if (ctrlCCount >= 2) {
+						triggerExit();
+						continue;
+					}
+					if (ctrlCTimer) clearTimeout(ctrlCTimer);
+					ctrlCTimer = setTimeout(resetCtrlC, ctrlCWindowMs);
+					(ctrlCTimer as { unref?: () => void }).unref?.();
+					continue;
+				}
+				resetCtrlC();
+				if (char === "\r" || char === "\n") {
+					if (isExitCommandLine(line)) triggerExit();
+					line = "";
+					continue;
+				}
+				if (char === "\b" || char === "\x7f") {
+					line = line.slice(0, -1);
+					continue;
+				}
+				if (line.length < EXIT_INPUT_GUARD_MAX_BUFFER) line += char;
+			}
+		},
+		dispose(): void {
+			resetCtrlC();
+			line = "";
+		},
+	};
+}
+
+interface ProcessStreamLike {
+	on?(event: "data", listener: (chunk: unknown) => void): unknown;
+	prependListener?(event: "data", listener: (chunk: unknown) => void): unknown;
+	off?(event: "data", listener: (chunk: unknown) => void): unknown;
+	removeListener?(event: "data", listener: (chunk: unknown) => void): unknown;
+}
+
+type ProcessSignal = "SIGINT" | "SIGTERM";
+
+interface ProcessLike {
+	stdin?: ProcessStreamLike;
+	once?(event: "exit", listener: () => void): unknown;
+	removeListener?(event: string, listener: (...args: unknown[]) => void): unknown;
+	prependOnceListener?(event: ProcessSignal, listener: () => void): unknown;
+	listenerCount?(event: ProcessSignal): number;
+	kill?(pid: number, signal: ProcessSignal): unknown;
+	pid?: number;
+}
+
+function installUsageStatusExitGuards(controller: UsageStatusController, processLike: ProcessLike = process): () => void {
+	const cleanup: Array<() => void> = [];
+	const suspend = (): void => {
+		controller.dispose(undefined, { render: false });
+	};
+	const stdin = processLike.stdin;
+	if (stdin && (typeof stdin.prependListener === "function" || typeof stdin.on === "function")) {
+		const detector = createUsageStatusInputExitDetector(suspend);
+		const listener = (chunk: unknown): void => {
+			detector.handle(chunk);
+		};
+		if (typeof stdin.prependListener === "function") stdin.prependListener("data", listener);
+		else stdin.on?.("data", listener);
+		cleanup.push(() => {
+			detector.dispose();
+			if (typeof stdin.off === "function") stdin.off("data", listener);
+			else stdin.removeListener?.("data", listener);
+		});
+	}
+
+	const installSignalGuard = (signal: ProcessSignal): void => {
+		if (typeof processLike.prependOnceListener !== "function") return;
+		const priorListeners = processLike.listenerCount?.(signal) ?? 1;
+		const handler = (): void => {
+			suspend();
+			if (priorListeners === 0 && processLike.pid !== undefined && typeof processLike.kill === "function") {
+				processLike.removeListener?.(signal, handler);
+				processLike.kill(processLike.pid, signal);
+			}
+		};
+		processLike.prependOnceListener(signal, handler);
+		cleanup.push(() => {
+			processLike.removeListener?.(signal, handler);
+		});
+	};
+	installSignalGuard("SIGINT");
+	installSignalGuard("SIGTERM");
+
+	const exitHandler = (): void => {
+		suspend();
+	};
+	processLike.once?.("exit", exitHandler);
+	cleanup.push(() => {
+		processLike.removeListener?.("exit", exitHandler);
+	});
+
+	return () => {
+		while (cleanup.length > 0) cleanup.pop()?.();
+	};
+}
+
 function requestStatusLineRender(ctx: ExtensionContext): void {
 	ctx.ui.setStatus(STATUS_KEY, "");
 }
@@ -521,6 +663,7 @@ export default function usageStatusBarExtension(pi: ExtensionAPI): void {
 		pi.logger?.warn?.("Usage Status could not patch the Pi status line; usage segment will stay hidden");
 	}
 	const controller = new UsageStatusController(pi.logger);
+	const cleanupExitGuards = installUsageStatusExitGuards(controller);
 
 	pi.on("session_start", async (_event, ctx) => {
 		await controller.start(ctx);
@@ -552,5 +695,6 @@ export default function usageStatusBarExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		controller.dispose(ctx, { render: false });
+		cleanupExitGuards();
 	});
 }

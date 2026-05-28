@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { Model, UsageLimit, UsageReport } from "../src/omp-types";
-import { UsageStatusController, installPiStatusLinePatch, resetPiStatusLinePatchForTest } from "../src/index";
+import { UsageStatusController, createUsageStatusInputExitDetector, installPiStatusLinePatch, resetPiStatusLinePatchForTest } from "../src/index";
 import {
 	DEFAULT_CONFIG,
 	STATUS_KEY,
@@ -418,6 +418,25 @@ describe("extension refresh controller", () => {
 		controller.dispose(ctx as never);
 		resetPiStatusLinePatchForTest();
 	});
+	test("input exit detector suspends on /exit and double ctrl-c", () => {
+		let exits = 0;
+		const detector = createUsageStatusInputExitDetector(() => {
+			exits += 1;
+		}, 10_000);
+		try {
+			detector.handle("/ex");
+			detector.handle(new TextEncoder().encode("it\r"));
+			expect(exits).toBe(1);
+
+			detector.handle("\x03");
+			expect(exits).toBe(1);
+			detector.handle("\x03");
+			expect(exits).toBe(2);
+		} finally {
+			detector.dispose();
+		}
+	});
+
 	test("start waits for the initial usage refresh before returning", async () => {
 		let releaseFetch: (() => void) | undefined;
 		let markFetchStarted: (() => void) | undefined;
