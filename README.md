@@ -26,17 +26,6 @@ omp plugin doctor
 
 Restart OMP after installation.
 
-From a local checkout while developing or testing:
-
-```sh
-mkdir -p ~/.omp/plugins
-cd ~/.omp/plugins
-npm install file:../../omp-hud
-omp plugin doctor
-```
-
-The local path above is valid when this repository is checked out at `~/omp-hud`; use an absolute `file:/path/to/omp-hud` URL or adjust the relative path for other checkout locations.
-
 From GitHub before the package is published:
 
 ```sh
