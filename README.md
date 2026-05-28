@@ -16,22 +16,22 @@ K ⟲ > (sub) ▶ 🪙 5h 9% (↻ 1h53m) / W 36% (↻ 3d8h) ───── sess
 
 ## Install
 
-From npm:
-
-```sh
-omp plugin install @oh-my-pi/omp-usage-status
-omp plugin list
-omp plugin doctor
-```
-
-Restart OMP after installation.
-
-From GitHub before the package is published:
+Install from GitHub until the npm package is published:
 
 ```sh
 mkdir -p ~/.omp/plugins
 cd ~/.omp/plugins
 npm install github:zevorn/omp-usage-status
+omp plugin doctor
+```
+
+Restart OMP after installation.
+
+After the package is published to npm, OMP's plugin installer can be used when `bun` is available on `PATH`:
+
+```sh
+omp plugin install @oh-my-pi/omp-usage-status
+omp plugin list
 omp plugin doctor
 ```
 
